@@ -1,175 +1,138 @@
+import subprocess
+import json
 import os
 from pathlib import Path
-import subprocess
+from datetime import datetime
 
-home = str(Path.home())
-wifi_logger_path = os.path.join(home, "wifi_logger_1.py")
-plist_path = os.path.join(home, "Library/LaunchAgents/com.user.wifilogger.plist")
+# ===== Configuration =====
+JSON_FILE = os.path.expanduser("~/wifi_connection_log.json")
+PLIST_PATH = os.path.expanduser("~/Library/LaunchAgents/com.user.wifilogger.plist")
+PYTHON_PATH = "/usr/bin/python3"
+SCRIPT_PATH = os.path.abspath(__file__)
+OFFICE_SSIDS = {"ACT_BB", "Airtel_ajan_6120"}  # Update with your office SSIDs
+EXPECTED_OFFICE_DAYS = 12
 
-# Create wifi_logger.py
-wifi_logger_content = '''\
-import subprocess
-import datetime
-import os
-import json
+# ===== Load/Save JSON Log =====
+def load_existing_log():
+    if os.path.exists(JSON_FILE):
+        with open(JSON_FILE, "r") as f:
+            return json.load(f)
+    return {}
 
-def get_wifi_info():
-    ssid = "Unknown"
-    bssid = "Unavailable"
+def save_log(log):
+    with open(JSON_FILE, "w") as f:
+        json.dump(log, f, indent=2)
+
+# ===== Parse Wi-Fi Logs from System =====
+def get_wifi_connections_last_2h():
+    command = """
+    log show --style syslog --predicate 'process == "airportd"' --last 2d | \
+    grep -i "Successfully associated to" | \
+    sed -E 's/.*([0-9]{4}-[0-9]{2}-[0-9]{2}).*Successfully associated to Wi-Fi network (.*) on interface.*/\\1 \\2/' | \
+    sort | uniq
+    """
     try:
-        result = subprocess.run(
-            ["networksetup", "-getairportnetwork", "en0"],
-            capture_output=True, text=True
-        )
-        if "You are not associated" in result.stdout:
-            ssid = "Not Connected"
-        else:
-            ssid = result.stdout.strip().split(": ")[1]
-
-        bssid_result = subprocess.run(
-            ["/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport", "-I"],
-            capture_output=True, text=True
-        )
-        for line in bssid_result.stdout.split("\\n"):
-            if " BSSID:" in line:
-                bssid = line.strip().split(": ")[1]
+        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(" Error from log command:", result.stderr.strip())
+            return []
+        return result.stdout.strip().split("\n")
     except Exception as e:
-        ssid = bssid = f"Error: {e}"
-    return ssid, bssid
+        print("Exception while running command:", str(e))
+        return []
 
-def log_wifi_info():
-    ssid, bssid = get_wifi_info()
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_entry = {
-        "timestamp": timestamp,
-        "ssid": ssid,
-        "bssid": bssid
-    }
+# ===== Update Log with New Entries =====
+def update_wifi_log():
+    wifi_logs = get_wifi_connections_last_2h()
+    if not wifi_logs:
+        return
 
-    log_path = os.path.expanduser("~/wifi_log_1.json")
-    if os.path.exists(log_path):
-        try:
-            with open(log_path, "r") as f:
-                logs = json.load(f)
-        except json.JSONDecodeError:
-            logs = []
-    else:
-        logs = []
+    log_data = load_existing_log()
 
-    logs.append(log_entry)
-    with open(log_path, "w") as f:
-        json.dump(logs, f, indent=2)
+    for line in wifi_logs:
+        parts = line.strip().split(maxsplit=1)
+        if len(parts) == 2:
+            date, ssid = parts
+            if date not in log_data:
+                log_data[date] = []
+            if ssid not in log_data[date]:
+                log_data[date].append(ssid)
 
-def count_days_connected_to_ssids(log_path, ssid_names):
-    if not os.path.exists(log_path):
-        return 0
+    save_log(log_data)
+    print(f"Wi-Fi log updated at {JSON_FILE}")
 
-    with open(log_path, "r") as f:
-        try:
-            logs = json.load(f)
-        except json.JSONDecodeError:
-            return 0
+# ===== Count Office Visit Days =====
+def count_office_days(log):
+    current_month = datetime.today().strftime("%Y-%m")
+    return sum(
+        1 for date, ssids in log.items()
+        if date.startswith(current_month) and any(ssid in OFFICE_SSIDS for ssid in ssids)
+    )
 
-    current_month = datetime.datetime.now().strftime("%Y-%m")
-    connected_days = set()
+# ===== Add Reminder to macOS =====
+def add_reminder_to_macos(attended_days, remaining_days):
+    title = f"Attended office for {attended_days} day(s) this month – {remaining_days} more to go!"
 
-    for entry in logs:
-        ssid = entry.get("ssid")
-        if ssid in ssid_names:
-            try:
-                ts = datetime.datetime.strptime(entry["timestamp"], "%Y-%m-%d %H:%M:%S")
-                if ts.strftime("%Y-%m") == current_month:
-                    connected_days.add(ts.date())
-            except Exception:
-                continue
-
-    return len(connected_days)
-
-def delete_old_reminders(keyword="Attended office for"):
-    script = f"""
+    clear_script = """
     tell application "Reminders"
-        set theList to reminders of default list
-        repeat with r in theList
-            if name of r starts with "{keyword}" then
+        set theList to list "Reminders"
+        repeat with r in (get reminders of theList)
+            if name of r starts with "Attended office for" then
                 delete r
             end if
         end repeat
     end tell
     """
-    subprocess.run(["osascript", "-e", script])
+    subprocess.run(["osascript", "-e", clear_script])
 
-def create_mac_reminder(title, note=""):
-    script = f"""
+    add_script = f'''
     tell application "Reminders"
-        set newReminder to make new reminder with properties {{name:"{title}", body:"{note}"}}
+        make new reminder with properties {{name:"{title}"}}
     end tell
-    """
-    subprocess.run(["osascript", "-e", script])
+    '''
+    subprocess.run(["osascript", "-e", add_script])
+    print(f" Reminder added: {title}")
 
-if __name__ == "__main__":
-    log_wifi_info()
-    ssid_names = {"wifi_name1", "wifi_name2"}
-    log_file_path = os.path.expanduser("~/wifi_log_1.json")
-    days = count_days_connected_to_ssids(log_file_path, ssid_names)
-    delete_old_reminders("Attended office for")
-    if days > 0:
-        title = title = f"Attended office for {days} day(s) this month - Remaining {12 - days} to go!!!"
-        note = "Check your PTO's and SL's."
-        create_mac_reminder(title, note)
-'''
+# ===== Show Summary & Update Reminder =====
+def print_office_visit_summary():
+    log = load_existing_log()
+    office_days = count_office_days(log)
+    remaining = max(EXPECTED_OFFICE_DAYS - office_days, 0)
+    print(f"Office visits this month: {office_days} day(s)")
+    print(f"Remaining to reach {EXPECTED_OFFICE_DAYS}: {remaining} day(s)")
+    add_reminder_to_macos(office_days, remaining)
 
-try:
-    with open(wifi_logger_path, "w") as f:
-        f.write(wifi_logger_content)
-    os.chmod(wifi_logger_path, 0o755)
-    print(f"Created {wifi_logger_path}")
-except Exception as e:
-    print(f"Failed to create wifi_logger.py: {e}")
-
-
-
-# Create LaunchAgent plist
-plist_content = f'''\
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" 
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+# ===== Create & Load launchd plist (for automation) =====
+def create_and_load_launchd_plist():
+    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
     <string>com.user.wifilogger</string>
-
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
-        <string>{wifi_logger_path}</string>
+        <string>{PYTHON_PATH}</string>
+        <string>{SCRIPT_PATH}</string>
     </array>
-
     <key>StartInterval</key>
-    <integer>300</integer> <!-- Every 2 hours -->
-
+    <integer>7200</integer>
     <key>RunAtLoad</key>
     <true/>
-
-    <key>StandardOutPath</key>
-    <string>/tmp/wifilogger.out</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/wifilogger.err</string>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/usr/bin:/bin:/usr/sbin:/sbin:/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources</string>
-    </dict>
 </dict>
 </plist>
-'''
+"""
+    os.makedirs(os.path.dirname(PLIST_PATH), exist_ok=True)
+    with open(PLIST_PATH, "w") as f:
+        f.write(plist_content)
 
-os.makedirs(os.path.dirname(plist_path), exist_ok=True)
-with open(plist_path, "w") as f:
-    f.write(plist_content)
-print(f"Created LaunchAgent at {plist_path}")
+    subprocess.run(["launchctl", "unload", PLIST_PATH], stderr=subprocess.DEVNULL)
+    subprocess.run(["launchctl", "load", PLIST_PATH])
+    print(f" launchd loaded: {PLIST_PATH} (runs every 2 hours)")
 
-# Load into launchd
-subprocess.run(["launchctl", "unload", plist_path], stderr=subprocess.DEVNULL)
-subprocess.run(["launchctl", "load", plist_path])
-print(" Loaded LaunchAgent — Wi-Fi logger will now run every 2 hours.")
+# ===== Main Entry Point =====
+if __name__ == "__main__":
+    update_wifi_log()
+    print_office_visit_summary()
+    create_and_load_launchd_plist()
